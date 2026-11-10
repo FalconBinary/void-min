@@ -411,6 +411,11 @@ pw='pa$$ `id` \n "q" !1'
 typed=${shown%%NETWORK*}$net${shown#*NETWORK}
 typed=${typed%%PASSWORD*}$pw${typed#*PASSWORD}
 is "typed as shown, the name and the password reach wpa_passphrase as they are" "$(eval "${typed%% >>*}")" "$(wpa_passphrase "$net" "$pw")"
+# why the quotes are single ones, in the hint's own words: "the shell changes $ and \ in a password"
+dq='pa$$w0rd and a\\b'
+is "in double quotes this shell would have changed one" \
+	"$(if [ "$(eval "wpa_passphrase n \"$dq\"")" = "n|$dq" ]; then echo kept; else echo changed; fi)" changed
+has "which is what the hint says" "$out" 'in double ones the shell changes $ and \ in a password.'
 readme=$(cat "$here/../README.md")
 has "the README shows the command the same way" "$readme" "wpa_passphrase '"
 lacks "and nowhere a name or a password in double quotes" "$readme" 'wpa_passphrase "'

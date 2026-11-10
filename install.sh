@@ -719,7 +719,7 @@ install.sh: no network. With a cable it comes up by itself; for Wi-Fi:
   sv restart wpa_supplicant
   sv restart dhcpcd
 
-Single quotes matter: in double ones the shell changes a password with $ or !.
+Single quotes matter: in double ones the shell changes $ and \ in a password.
 Then run this again.
 EOF
 	exit 1

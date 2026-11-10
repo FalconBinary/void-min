@@ -58,6 +58,16 @@ part_suffix() {
 	esac
 }
 
+# The disk under its own name, whatever link it was given by. Its partitions are named after it,
+# and one given as /dev/disk/by-id/... would be erased and then get partition names that do not
+# exist. Nothing but /dev/NAME passes, so nothing else can reach the commands either.
+canonical_disk() {
+	d=$(readlink -f -- "$1" 2>/dev/null) || d=$1
+	[ -n "$d" ] || d=$1
+	printf '%s\n' "$d" | grep -Eq '^/dev/[A-Za-z0-9]+$' || return 1
+	echo "$d"
+}
+
 valid_user() {
 	case $1 in
 	root | nobody | '') return 1 ;;
@@ -202,6 +212,8 @@ wired_interface() {
 	for dev in "$net"/*; do
 		[ -e "$dev/device" ] || continue
 		[ ! -e "$dev/wireless" ] || continue
+		# its name goes into commands and file names
+		case ${dev##*/} in *[!A-Za-z0-9_.-]*) continue ;; esac
 		if [ "$(cat "$dev/operstate" 2>/dev/null)" = up ]; then
 			basename "$dev"
 			return
@@ -305,20 +317,36 @@ ask_disk() {
 		'' | *[!0-9]*) n=0 ;;
 		esac
 		if [ "$n" -ge 1 ] && [ "$n" -le "$count" ]; then
-			break
+			line=$(printf '%s\n' "$disks" | sed -n "${n}p")
+			problem=$(disk_problem "${line%% *}")
+			[ -n "$problem" ] || break
+			echo "$problem." >&2
+			continue
 		fi
 		echo "That is not on the list." >&2
 	done
-	line=$(printf '%s\n' "$disks" | sed -n "${n}p")
 	disk=${line%% *}
 }
 
+# Why this disk cannot be installed on; nothing when it can.
+disk_problem() {
+	if [ ! -b "$1" ]; then
+		echo "$1 is not a disk"
+	elif [ "$(lsblk -dno TYPE "$1" 2>/dev/null)" != disk ]; then
+		echo "$1 is not a whole disk"
+	elif [ -n "$(lsblk -nlo MOUNTPOINT "$1" 2>/dev/null | tr -d '[:space:]')" ]; then
+		echo "$1 is in use: something on it is mounted"
+	else
+		bytes=$(lsblk -dnbo SIZE "$1" 2>/dev/null) || bytes=0
+		if [ "$((${bytes:-0} / 1048576))" -lt "$MIN_DISK_MIB" ]; then
+			echo "$1 is too small: at least $((MIN_DISK_MIB / 1024)) GiB is needed"
+		fi
+	fi
+}
+
 check_disk() {
-	[ -b "$disk" ] || die "$disk is not a disk"
-	[ "$(lsblk -dno TYPE "$disk" 2>/dev/null)" = disk ] || die "$disk is not a whole disk"
-	[ -z "$(lsblk -nlo MOUNTPOINT "$disk" 2>/dev/null | tr -d '[:space:]')" ] || die "$disk is in use: something on it is mounted"
-	bytes=$(lsblk -dnbo SIZE "$disk")
-	[ "$((bytes / 1048576))" -ge "$MIN_DISK_MIB" ] || die "$disk is too small: at least $((MIN_DISK_MIB / 1024)) GiB is needed"
+	problem=$(disk_problem "$disk")
+	[ -z "$problem" ] || die "$problem"
 }
 
 confirm_erase() {
@@ -400,9 +428,11 @@ EOF
 EOF
 	fi
 	cat <<EOF
-# the ISO's own xbps may be too old for today's packages
-xbps-install -Syi -R $repo xbps || true
-XBPS_ARCH=x86_64 xbps-install -Sy -r /mnt -R $repo $(base_packages)
+# the ISO's own xbps may be too old for today's packages. Every xbps here reads from nowhere: its
+# one question would be whether to trust a key this ISO does not know, and the answer is no
+xbps-install -Syi -R $repo xbps </dev/null || true
+XBPS_ARCH=x86_64 xbps-install -Sy -r /mnt -R $repo $(base_packages) </dev/null
+[ -x /mnt/usr/bin/xbps-query ] || { echo 'install.sh: nothing was installed from $repo' >&2; exit 1; }
 printf 'repository=%s\n' $repo > /mnt/etc/xbps.d/00-repository-main.conf
 EOF
 	# (a here-document, not echo: dash's echo would turn the \n into a line break itself)
@@ -433,14 +463,14 @@ EOF
 }
 
 step_drivers() {
-	echo 'xbps-install -Sy'
-	if cpu_is GenuineIntel; then echo 'xbps-install -y intel-ucode'; fi
+	echo 'xbps-install -Sy </dev/null'
+	if cpu_is GenuineIntel; then echo 'xbps-install -y intel-ucode </dev/null'; fi
 	if [ -n "$nvidia" ]; then
 		# The driver's settings window is an X11 program that mango never shows. Its libraries
 		# would bring GTK 2 and 3, an icon theme, CUPS and Avahi with them: 32 packages.
 		cat <<EOF
 printf 'ignorepkg=%s\n' $nvidia-gtklibs > /etc/xbps.d/12-nvidia.conf
-xbps-install -y $nvidia
+xbps-install -y $nvidia </dev/null
 EOF
 	fi
 	# Turing and newer sleep only when the driver is told they may
@@ -519,16 +549,20 @@ HOOK
 chmod +x /etc/kernel.d/post-install/60-limine
 ln -sf ../post-install/60-limine /etc/kernel.d/post-remove/60-limine
 EOF
-	cat <<EOF
-sed -i 's|^CMD="VOIDMIN-CMDLINE"\$|CMD="$(kernel_cmdline)"|' /etc/kernel.d/post-install/60-limine
+	cmd=$(kernel_cmdline)
+	sed -e "s|@CMD@|$cmd|" -e "s|@DISK@|$disk|" <<'EOF'
+sed -i 's|^CMD="VOIDMIN-CMDLINE"$|CMD="@CMD@"|' /etc/kernel.d/post-install/60-limine
 mkdir -p /boot/EFI/BOOT
 cp /usr/share/limine/BOOTX64.EFI /boot/EFI/BOOT/
-# the firmware finds \\EFI\\BOOT\\BOOTX64.EFI by itself; an entry of its own puts it first
+# The firmware finds \EFI\BOOT\BOOTX64.EFI by itself; an entry of its own puts it first. An entry
+# named Limine whose partition is gone is what an earlier install on this disk left, and goes.
+# One whose partition is still there belongs to another system, and stays, as does any other.
 mountpoint -q /sys/firmware/efi/efivars || mount -t efivarfs none /sys/firmware/efi/efivars || true
-for n in \$(efibootmgr 2>/dev/null | sed -n 's/^Boot\\([0-9A-Fa-f]\\{4\\}\\)\\*\\{0,1\\} Limine.*/\\1/p'); do
-	efibootmgr -q -b "\$n" -B || true
+efibootmgr -v 2>/dev/null | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\} Limine.*GPT,\([0-9A-Fa-f-]*\),.*/\1 \2/p' | while read -r n guid; do
+	guid=$(printf '%s' "$guid" | tr 'A-F' 'a-f')
+	[ -e "${VOIDMIN_PARTUUID:-/dev/disk/by-partuuid}/$guid" ] || efibootmgr -q -b "$n" -B || true
 done
-efibootmgr -q --create --disk $disk --part 1 --label Limine --loader '\\EFI\\BOOT\\BOOTX64.EFI' || echo 'no boot entry was written: the firmware still starts EFI/BOOT/BOOTX64.EFI'
+efibootmgr -q --create --disk @DISK@ --part 1 --label Limine --loader '\EFI\BOOT\BOOTX64.EFI' || echo 'no boot entry was written: the firmware still starts EFI/BOOT/BOOTX64.EFI'
 EOF
 }
 
@@ -595,9 +629,10 @@ live() { # title, commands
 		printf '%s\n' "$2"
 		return
 	fi
-	printf '%s\n' "$2" > /tmp/void-min-step
-	sh -eu /tmp/void-min-step
-	rm -f /tmp/void-min-step
+	step=$(mktemp /tmp/void-min.XXXXXX)
+	printf '%s\n' "$2" > "$step"
+	sh -eu "$step"
+	rm -f "$step"
 }
 
 chrooted() { # title, commands
@@ -626,7 +661,7 @@ enter_root() {
 save_wifi() {
 	[ -n "$wifi_ssid" ] || return 0
 	echo
-	echo "==> Wi-Fi: $wifi_ssid is saved for iwd and joined at the first boot"
+	printf '==> Wi-Fi: %s is saved for iwd and joined at the first boot\n' "$wifi_ssid"
 	[ "$dry_run" -eq 0 ] || return 0
 	file=$(iwd_file_name "$wifi_ssid")
 	install -d -m 700 /mnt/var/lib/iwd
@@ -673,6 +708,19 @@ EOF
 	exit 1
 }
 
+# The mirror's package list, read with the keys this ISO trusts and nobody at the keyboard, while
+# the disk is still untouched. A list signed with any other key makes xbps ask whether to trust
+# it: the answer here is always no, and xbps installs nothing from what it does not trust.
+check_mirror() {
+	repo=$mirror/current
+	out=$(xbps-install -S -i -R "$repo" </dev/null 2>&1) || true
+	case $out in
+	*'import this public key'*) die "the packages at $mirror are not signed with a key this ISO trusts. Nothing was touched." ;;
+	esac
+	xbps-query -i -R --repository="$repo" -p pkgver base-system >/dev/null 2>&1 ||
+		die "no Void packages at $mirror: is the address right? Nothing was touched."
+}
+
 show_plan() {
 	echo
 	echo "Void Linux on $disk: 1 GiB for /boot (EFI), the rest for / (XFS). No encryption, no swap partition."
@@ -684,7 +732,7 @@ show_plan() {
 		echo "No cable in use: dhcpcd is left out, iwd gets the address for Wi-Fi."
 	fi
 	if [ -n "$wifi_ssid" ]; then
-		echo "Wi-Fi: $wifi_ssid, as joined here, is saved for the first boot."
+		printf 'Wi-Fi: %s, as joined here, is saved for the first boot.\n' "$wifi_ssid"
 	else
 		echo "Wi-Fi: nothing to carry over; after the first boot: iwctl station wlan0 connect NAME"
 	fi
@@ -742,6 +790,10 @@ main() {
 		esac
 		shift
 	done
+	if [ -n "$disk" ]; then
+		given=$disk
+		disk=$(canonical_disk "$given") || die "not a disk: $given (give it as /dev/NAME, or by a link to it)"
+	fi
 	valid_user "$user" || die "not a user name: $user (letters, digits, _ and -, up to 32, not root)"
 	valid_host "$host" || die "not a host name: $host"
 	valid_mirror "$mirror" || die "not a mirror address: $mirror (https://... without spaces)"
@@ -751,6 +803,7 @@ main() {
 		check_system
 		clean_previous
 		check_network
+		check_mirror
 	fi
 	if [ -z "$disk" ]; then
 		ask_disk

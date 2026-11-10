@@ -131,8 +131,16 @@ class Run:
         self.vars = os.path.join(opts.work, "vars.fd")
         self.log_path = os.path.join(opts.work, "serial.log")
         self.disk_dev = "/dev/vda" if opts.disk_bus == "virtio" else "/dev/nvme0n1"
+        # a second disk, too small to install on: something to refuse, and a home for the firmware
+        # entries of "another system"
+        self.small = os.path.join(opts.work, "small.qcow2")
+        self.small_dev = "/dev/vdb" if opts.disk_bus == "virtio" else "/dev/vda"
+        self.gone = self.other = ""
         self.wired = ""
         self.notes = []
+
+    def part(self, n):
+        return f"{self.disk_dev}{'p' if self.disk_dev[-1].isdigit() else ''}{n}"
 
     # ------------------------------------------------------------ machine
 
@@ -149,6 +157,8 @@ class Run:
                 dst.write(src.read())
         if not os.path.exists(self.disk):
             subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", self.disk, self.o.disk_size], check=True)
+        if not os.path.exists(self.small):
+            subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", self.small, "1G"], check=True)
         kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
         args = [
             "qemu-system-x86_64", "-machine", "q35,vmport=off", "-m", str(self.o.memory), "-smp", str(self.o.cpus),
@@ -158,6 +168,8 @@ class Run:
             "-drive", f"if=pflash,format=raw,file={self.vars}",
             "-drive", f"file={self.disk},if=none,id=disk0,format=qcow2,discard=unmap",
             "-device", "nvme,drive=disk0,serial=voidmin" if self.o.disk_bus == "nvme" else "virtio-blk-pci,drive=disk0",
+            "-drive", f"file={self.small},if=none,id=disk1,format=qcow2",
+            "-device", "virtio-blk-pci,drive=disk1",
             "-device", "virtio-vga",
             "-nic", "user,model=virtio-net-pci",
             "-device", "virtio-rng-pci",
@@ -266,6 +278,40 @@ class Run:
         self.sh(f"wpa_passphrase '{WIFI_SSID}' '{WIFI_PASSPHRASE}' >> /etc/wpa_supplicant/wpa_supplicant.conf", what="a Wi-Fi network in wpa_supplicant.conf")
 
         before = self.out(f"lsblk -nro NAME {self.disk_dev} | wc -l")
+
+        # A mirror signed with a key the ISO does not trust: here, the real one with the ISO's keys
+        # put away. It has to stop before a single question, with the disk as it was.
+        refused = self.sh(f"mkdir -p /root/keys.away && mv /var/db/xbps/keys/* /root/keys.away/; rc=0; sh /root/install.sh --disk {self.disk_dev} --timezone UTC || rc=$?; "
+                          "mv /root/keys.away/* /var/db/xbps/keys/; echo refused-rc=$rc", check=False)
+        self.expect("packages signed with a key the ISO does not trust stop the install before anything is touched",
+                    "not signed with a key this ISO trusts" in refused and "refused-rc=1" in refused and self.out(f"lsblk -nro NAME {self.disk_dev} | wc -l") == "1", refused[-500:])
+
+        # A disk given by a link to it is installed on under its own name.
+        link = self.out(f"for l in /dev/disk/by-id/*; do [ \"$(readlink -f $l)\" = {self.disk_dev} ] && echo $l && break; done; true").strip().splitlines()[-1:]
+        if link:
+            by_link = self.sh(f"printf '\\n' | sh /root/install.sh --dry-run --disk {link[0].strip()}", what="a dry run with the disk given by a link")
+            self.expect("a disk given by its /dev/disk/by-id link gets its real partition names", f"mkfs.vfat -F32 -n EFI {self.part(1)}\n" in by_link, by_link[:600])
+        else:
+            self.expect("the VM's disk has a /dev/disk/by-id link to test with", False, self.out("ls -l /dev/disk/by-id"))
+
+        # Test only: what other installs leave in the firmware. One entry named Limine whose partition
+        # no longer exists, as an earlier install on a disk since repartitioned leaves; one whose
+        # partition is there, as another system on another disk has. The first must go, the second stay.
+        self.sh("command -v efibootmgr >/dev/null || xbps-install -Sy -R https://repo-de.voidlinux.org/current efibootmgr", what="efibootmgr in the live system")
+        small = self.small_dev
+        made = self.sh(f"""printf 'label: gpt\\nsize=64M, type=U\\n' | sfdisk -q --wipe always {small}
+udevadm settle
+efibootmgr -q --create --disk {small} --part 1 --label Limine --loader '\\EFI\\GONE\\BOOTX64.EFI'
+echo gone=$(lsblk -dno PARTUUID {small}1)
+printf 'label: gpt\\nsize=64M, type=U\\n' | sfdisk -q --wipe always {small}
+udevadm settle
+efibootmgr -q --create --disk {small} --part 1 --label Limine --loader '\\EFI\\OTHER\\BOOTX64.EFI'
+echo other=$(lsblk -dno PARTUUID {small}1)
+efibootmgr -v | grep Limine""", what="two firmware entries named Limine, one of them dead")
+        self.gone = (re.findall(r"gone=([0-9a-f-]{36})", made) or [""])[-1]
+        self.other = (re.findall(r"other=([0-9a-f-]{36})", made) or [""])[-1]
+        self.expect("the firmware now has a dead Limine entry and another system's", bool(self.gone) and bool(self.other) and self.gone != self.other
+                    and self.gone in made.lower() and self.other in made.lower(), made[-600:])
         dry = self.sh(f"printf '\\n' | sh /root/install.sh --dry-run --disk {self.disk_dev}", what="a dry run")
         self.expect("a dry run prints the commands and says so", "That was a dry run: nothing was changed." in dry and "sfdisk --wipe always" in dry, dry[-300:])
         self.expect("a dry run leaves the disk alone", self.out(f"lsblk -nro NAME {self.disk_dev} | wc -l") == before and before == "1", before)
@@ -283,9 +329,15 @@ class Run:
                 vm.send(answer + "\n")
             return m
 
-        say(r"Install on disk number \[1\]: ", "7")
+        listing = say(r"(?s)Disks:\r?\n(.*?)Install on disk number: ").group(1)
+        numbers = dict((m.group(2), m.group(1)) for m in re.finditer(r"(\d+)\) (/dev/\S+)", listing))
+        self.expect("both disks are offered", self.disk_dev in numbers and self.small_dev in numbers, listing)
+        vm.send("7\n")
         say(r"That is not on the list")
-        say(r"Install on disk number \[1\]: ", "")
+        say(r"Install on disk number: ", numbers.get(self.small_dev, "2"))
+        small_said = say(r"(?m)^(\S+) is too small: at least 12 GiB is needed\.").group(1)
+        self.expect("a disk too small to install on is refused by name, and the question comes again", small_said == self.small_dev, small_said)
+        say(r"Install on disk number: ", numbers.get(self.disk_dev, "1"))
         say(r"Time zone, as Europe/Kyiv \[UTC\]: ", "Europe/Nowhere")
         say(r"No such zone")
         say(r"Time zone, as Europe/Kyiv \[UTC\]: ", ZONE)
@@ -360,6 +412,11 @@ class Run:
         status = out("for s in /var/service/*; do sv status $s; done")
         expect("every service runs", "down:" not in status and "fail:" not in status and status.count("run:") >= len(want), status)
         expect("the network works after the reboot", "net-yes" in out("getent hosts voidlinux.org >/dev/null && echo net-yes || echo net-no"), out("ip -br addr; cat /etc/resolv.conf"))
+        tcp = out("ss -H -lnt | wc -l")
+        udp = out("ss -H -lnu | awk '{print $4}' | sort -u | tr '\\n' ' '").split()
+        outside = [a for a in udp if not (a.startswith("127.") or a.startswith("[::1]") or a.rsplit(":", 1)[-1] in ("68", "546"))]
+        expect("nothing listens on the network: no TCP at all, UDP only for the DHCP client and on the loopback", tcp == "0" and not outside, f"tcp={tcp} udp={udp}")
+        self.note("listening: TCP none, UDP " + (" ".join(udp) or "none"))
         expect("swap is zram, compressed with zstd", "zram" in out("swapon --noheadings --show=NAME") and "[zstd]" in out("cat /sys/block/zram0/comp_algorithm"),
                out("swapon --show; cat /sys/block/zram0/comp_algorithm"))
 
@@ -390,7 +447,13 @@ class Run:
         menu = out("cat /boot/limine.conf")
         entries = re.findall(r"(?m)^/Void (\S+)$", menu)
         expect("the boot menu's first entry is the running kernel", entries[:1] == [kernel] and "timeout: 1" in menu, menu[:400])
-        expect("the firmware has an entry for Limine", "Limine" in out("efibootmgr"), out("efibootmgr"))
+        efi = out("efibootmgr -v")
+        ours = out(f"lsblk -dno PARTUUID {self.part(1)}").lower()
+        first = re.search(r"BootOrder: ([0-9A-Fa-f]{4})", efi)
+        first_line = next((line for line in efi.splitlines() if first and line.startswith("Boot" + first.group(1))), "")
+        expect("the firmware starts this install's Limine first", "Limine" in first_line and bool(ours) and ours in first_line.lower(), efi)
+        expect("the Limine entry whose partition was gone is removed, another system's is left alone",
+               bool(self.gone) and self.gone not in efi.lower() and self.other in efi.lower(), efi)
         size = out("du -m /boot/initramfs-*.img | cut -f1")
         expect("the initramfs holds this machine's drivers only", size.isdigit() and int(size) <= 40, f"{size} MiB")
         expect("the package cache is empty", out("ls /var/cache/xbps | wc -l") == "0", out("du -sh /var/cache/xbps"))

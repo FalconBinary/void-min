@@ -156,6 +156,14 @@ is "Europe/Nowhere is not" "$(zone Europe/Nowhere)" 1
 is "a path out of zoneinfo is not" "$(zone ../etc/passwd)" 1
 is "an absolute path is not" "$(zone /etc/passwd)" 1
 
+is "a disk by its own name is itself" "$(lib 'canonical_disk /dev/nvme0n1')" /dev/nvme0n1
+ln -s /dev/null "$work/a-link"
+is "a link is followed to what it names" "$(lib "canonical_disk $work/a-link")" /dev/null
+is "a link that leads to no /dev/NAME is refused" "$(status 'canonical_disk /dev/disk/by-id/no-such-disk')" 1
+is "nothing with shell in it is a disk" "$(status "canonical_disk '/dev/sda;reboot'")" 1
+is "a path elsewhere is not a disk" "$(status 'canonical_disk /tmp/disk.img')" 1
+is "what is not a block device cannot be installed on" "$(lib 'disk_problem /dev/null')" "/dev/null is not a disk"
+
 is "an https mirror is taken" "$(status 'valid_mirror https://mirror.yandex.ru/mirrors/voidlinux')" 0
 is "an http mirror is not" "$(status 'valid_mirror http://repo-de.voidlinux.org')" 1
 is "a mirror with shell in it is not" "$(status 'valid_mirror "https://x.org/;reboot"')" 1
@@ -167,8 +175,8 @@ is "GF63: Mesa for Intel beside it" "$(on gf63 gpu_packages)" "mesa-dri vulkan-l
 is "GF63: AMD's and Broadcom's firmware go, and nouveau's: NVIDIA's driver has its own" \
 	"$(on gf63 'nvidia=$(nvidia_package); firmware_to_drop')" " linux-firmware-nvidia linux-firmware-amd linux-firmware-broadcom"
 drivers=$(on gf63 'nvidia=$(nvidia_package); step_drivers')
-has "GF63: Intel microcode" "$drivers" "xbps-install -y intel-ucode"
-has "GF63: NVIDIA's driver" "$drivers" "xbps-install -y nvidia"
+has "GF63: Intel microcode" "$drivers" "xbps-install -y intel-ucode </dev/null"
+has "GF63: NVIDIA's driver, with nobody to answer a question about a key" "$drivers" "xbps-install -y nvidia </dev/null"
 has "GF63: the GPU may sleep" "$drivers" "NVreg_DynamicPowerManagement=0x02"
 has "GF63: without the settings window's GTK" "$drivers" "printf 'ignorepkg=%s\\n' nvidia-gtklibs > /etc/xbps.d/12-nvidia.conf"
 has "GF63: the kernel is told about NVIDIA's modeset" "$(on gf63 'nvidia=$(nvidia_package); kernel_cmdline')" "nvidia_drm.modeset=1"
@@ -219,6 +227,9 @@ is "GF63: it has Wi-Fi" "$(on gf63 'if has_wifi; then echo yes; else echo no; fi
 is "Ryzen: the cable that is up" "$(on ryzen wired_interface)" enp6s0
 is "VM: eth0" "$(on vm wired_interface)" eth0
 is "VM: no Wi-Fi" "$(on vm 'if has_wifi; then echo yes; else echo no; fi')" no
+machine odd GenuineIntel
+iface odd 'eth0;reboot' wired up
+is "an interface whose name could not go into a command is not taken" "$(on odd wired_interface)" ""
 
 wifi() { # machine, [ssid]
 	on "$1" "wifi_from_wpa \"\$wpa_conf\" ${2:+\"$2\"}; echo \"\$wifi_ssid|\$wifi_key|\$wifi_value\""
@@ -275,7 +286,7 @@ has "GF63: the user is Bivel, as written" "$out" "useradd --badname -m -G wheel,
 has "GF63: the machine is void" "$out" "echo void > /etc/hostname"
 has "GF63: the time zone" "$out" "ln -sf /usr/share/zoneinfo/Europe/Kyiv /etc/localtime"
 has "GF63: what starts it, joins Wi-Fi and shows a terminal in mango, and no more" "$out" \
-	"-R https://repo-de.voidlinux.org/current base-system zstd limine efibootmgr iwd openresolv dbus elogind chrony zramen snooze run-parts opendoas mangowc foot dejavu-fonts-ttf mesa-dri vulkan-loader mesa-vulkan-intel
+	"-R https://repo-de.voidlinux.org/current base-system zstd limine efibootmgr iwd openresolv dbus elogind chrony zramen snooze run-parts opendoas mangowc foot dejavu-fonts-ttf mesa-dri vulkan-loader mesa-vulkan-intel </dev/null
 "
 lacks "GF63: git is left to kombain" "$out" "opendoas git"
 has "GF63: without a cable dhcpcd goes" "$out" "ignorepkg=%s\\n' wpa_supplicant sudo btrfs-progs f2fs-tools dhcpcd linux-firmware-nvidia linux-firmware-amd linux-firmware-broadcom >"
@@ -311,6 +322,10 @@ has "and the next answer is taken" "$out" "time zone Europe/Kyiv"
 
 dry vm --disk /dev/vda --timezone UTC --user root >/dev/null 2>&1
 is "root as the user is refused" $? 1
+dry vm --disk '/dev/vda; reboot' --timezone UTC >/dev/null 2>&1
+is "a disk that is not /dev/NAME is refused" $? 1
+dry vm --disk /dev/disk/by-id/no-such-disk --timezone UTC >/dev/null 2>&1
+is "so is a link that leads nowhere" $? 1
 dry vm --disk /dev/vda --timezone UTC --mirror 'http://x' >/dev/null 2>&1
 is "a mirror without https is refused" $? 1
 dry vm --disk /dev/vda --timezone Mars/Olympus >/dev/null 2>&1
@@ -318,6 +333,66 @@ is "a time zone that is not there is refused" $? 1
 dry vm --frobnicate >/dev/null 2>&1
 is "an unknown option is refused" $? 1
 has "--help says what it does" "$(sh "$script" --help)" "--disk DEV       the disk to erase and install on"
+
+# ---------------------------------------------------------------- the mirror, before anything is erased
+
+for kind in trusted foreign silent; do mkdir -p "$work/$kind"; done
+cat > "$work/trusted/xbps-install" <<'EOF'
+#!/bin/sh
+echo "[*] Updating repository \`https://x.org/current/x86_64-repodata' ..."
+EOF
+cat > "$work/trusted/xbps-query" <<'EOF'
+#!/bin/sh
+echo base-system-0.114_2
+EOF
+# what xbps says of a list signed with a key it does not know, with nobody to answer
+cat > "$work/foreign/xbps-install" <<'EOF'
+#!/bin/sh
+echo "\`https://x.org/current' repository has been RSA signed by \"Somebody\""
+echo "Fingerprint: 00:11:22"
+echo "Do you want to import this public key? [Y/n] ERROR: Failed to import pubkey from https://x.org/current"
+EOF
+cp "$work/trusted/xbps-query" "$work/foreign/xbps-query"
+printf '#!/bin/sh\nexit 1\n' > "$work/silent/xbps-install"
+printf '#!/bin/sh\nexit 2\n' > "$work/silent/xbps-query"
+chmod +x "$work"/trusted/* "$work"/foreign/* "$work"/silent/*
+mirror() { # which stand-in for xbps
+	PATH=$work/$1:$PATH lib 'mirror=https://x.org; check_mirror' 2>&1
+	echo "exit $?"
+}
+is "a mirror signed with a key the ISO trusts passes" "$(mirror trusted)" "exit 0"
+out=$(mirror foreign)
+has "a mirror signed with any other key stops it" "$out" "the packages at https://x.org are not signed with a key this ISO trusts. Nothing was touched."
+has "and it stops there" "$out" "exit 1"
+out=$(mirror silent)
+has "an address with no Void packages stops it" "$out" "no Void packages at https://x.org"
+has "and there" "$out" "exit 1"
+
+# ---------------------------------------------------------------- the firmware's boot entries
+
+mkdir -p "$work/efi" "$work/partuuid"
+: > "$work/partuuid/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+cat > "$work/efi/efibootmgr" <<'EOF'
+#!/bin/sh
+echo "$*" >> "$EFI_LOG"
+[ "$1" = -v ] || exit 0
+cat <<'OUT'
+BootCurrent: 0002
+Timeout: 0 seconds
+BootOrder: 0002,0001,0003,0004,0000
+Boot0000* UiApp	FvVol(7cb8bdc9-f8eb-4f34-aaea-3ee4af6516a1)/FvFile(462caa21-7614-4503-836e-8ab6f4662331)
+Boot0001* Limine	HD(1,GPT,11111111-2222-3333-4444-555555555555,0x800,0x200000)/\EFI\BOOT\BOOTX64.EFI
+Boot0002* Limine	HD(1,GPT,AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE,0x800,0x200000)/\EFI\BOOT\BOOTX64.EFI
+Boot0003* Windows Boot Manager	HD(1,GPT,99999999-2222-3333-4444-555555555555,0x800,0x32000)/\EFI\Microsoft\Boot\bootmgfw.efi
+Boot0004* Limine over the network	PciRoot(0x0)/Pci(0x2,0x0)/MAC(525400123456,1)
+OUT
+EOF
+chmod +x "$work/efi/efibootmgr"
+on vm 'disk=/dev/vda; step_boot' | sed -n '/^efibootmgr -v/,$p' > "$work/entries.sh"
+EFI_LOG=$work/efi.log PATH=$work/efi:$PATH VOIDMIN_PARTUUID=$work/partuuid sh -eu "$work/entries.sh"
+is "the boot entries step ends well" $? 0
+is "of the entries named Limine only the one whose partition is gone is removed; another system's, Windows and the rest stay" \
+	"$(tr '\n' '|' < "$work/efi.log")" "-v|-q -b 0001 -B|-q --create --disk /dev/vda --part 1 --label Limine --loader \EFI\BOOT\BOOTX64.EFI|"
 
 # ---------------------------------------------------------------- the boot menu hook
 

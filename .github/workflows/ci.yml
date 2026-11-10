@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ISO: void-live-x86_64-20250202-base.iso
+  ISO_SHA256: 0f7439f500740f62dd18972cae448cec7d8a85032c7eb8f1bf946100d9a92161
+
+jobs:
+  checks:
+    name: shellcheck, and the decisions on made-up machines
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: shellcheck
+        run: shellcheck install.sh tests/unit.sh
+      - name: Every shell that may run it reads it
+        run: |
+          dash -n install.sh
+          bash -n install.sh
+          bash --posix -n install.sh
+      - name: The decisions, with Void's own shell and tools
+        # dash, gawk and GNU sed, as on the live ISO
+        run: docker run --rm -v "$PWD:/src:ro" -w /src ghcr.io/void-linux/void-glibc-full:latest sh tests/unit.sh
+      - name: The same under bash
+        run: bash tests/unit.sh
+
+  vm:
+    name: The whole install, in a VM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: QEMU with KVM
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends qemu-system-x86 qemu-utils ovmf libarchive-tools
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: The official ISO, by checksum
+        run: |
+          curl -fsSL "https://repo-default.voidlinux.org/live/20250202/$ISO" -o "$RUNNER_TEMP/$ISO"
+          echo "$ISO_SHA256  $RUNNER_TEMP/$ISO" | sha256sum -c -
+      - name: Install from the live ISO, boot the result, check it
+        env:
+          PRIVATE: ${{ github.event.repository.private }}
+        # the README's fetch command needs no account only while the repository is public
+        run: |
+          raw=
+          [ "$PRIVATE" = true ] || raw="--raw https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/install.sh"
+          python3 tests/vm.py --iso "$RUNNER_TEMP/$ISO" --work "$RUNNER_TEMP/vm" $raw
+      - name: Keep the console log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vm
+          path: |
+            ${{ runner.temp }}/vm/serial.log
+            ${{ runner.temp }}/vm/summary.md
+          if-no-files-found: warn

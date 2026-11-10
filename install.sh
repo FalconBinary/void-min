@@ -695,7 +695,9 @@ main() {
 	if [ "$dry_run" -eq 0 ]; then
 		root_uuid=$(blkid -s UUID -o value "$disk${suffix}2")
 		efi_uuid=$(blkid -s UUID -o value "$disk${suffix}1")
-		[ -n "$root_uuid" ] && [ -n "$efi_uuid" ] || die "the new partitions have no UUIDs"
+		if [ -z "$root_uuid" ] || [ -z "$efi_uuid" ]; then
+			die "the new partitions have no UUIDs"
+		fi
 		enter_root
 	fi
 	chrooted "Name, time, language, and what this machine does not need" "$(step_system)"

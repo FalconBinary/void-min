@@ -371,9 +371,10 @@ class Run:
         expect("doas is for wheel", out("cat /etc/doas.conf") == "permit :wheel" and out("stat -c %a /etc/doas.conf") == "400", out("cat /etc/doas.conf"))
 
         wifi = f"/var/lib/iwd/{WIFI_SSID}.psk"
+        # (iwd itself takes its directory from 700 to 600 when it starts)
         expect("the Wi-Fi network is saved for iwd, readable by root alone",
-               out(f"cat '{wifi}'") == f"[Security]\nPassphrase={WIFI_PASSPHRASE}" and out(f"stat -c %a '{wifi}'") == "600" and out("stat -c %a /var/lib/iwd") == "700",
-               out(f"ls -la /var/lib/iwd; cat '{wifi}'"))
+               out(f"cat '{wifi}'") == f"[Security]\nPassphrase={WIFI_PASSPHRASE}" and out(f"stat -c %a '{wifi}'") == "600" and out("stat -c %a /var/lib/iwd").endswith("00"),
+               out(f"stat -c '%a %n' /var/lib/iwd '{wifi}'; cat '{wifi}'"))
         expect("iwd configures the network itself", "EnableNetworkConfiguration=true" in out("cat /etc/iwd/main.conf"), out("cat /etc/iwd/main.conf"))
 
         kernel = out("uname -r")

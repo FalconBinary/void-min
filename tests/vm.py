@@ -35,7 +35,8 @@ LIVE_ARGS = (
 # None of these protect anything: they exist only inside this throwaway VM.
 PASSWORD = "test-password"
 WIFI_SSID = "void-min test"
-WIFI_PASSPHRASE = "test-wifi-passphrase"
+# Everything a shell or iwd could take for something else: it has to arrive as typed.
+WIFI_PASSPHRASE = " it's $HOME `id` \"q\" C:\\new !1"
 PROMPT = "VOIDMIN# "
 USER = "Bivel"
 HOST = "void"
@@ -119,6 +120,17 @@ class VM:
 
 def clean(text):
     return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\r", "", text)
+
+
+def typed(text):
+    """In single quotes, as the README says to type a name and a password; an apostrophe is '\\''."""
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def iwd_value(text):
+    """A value as iwd writes one itself: a backslash doubled, spaces in front as \\s."""
+    body = text.lstrip(" ")
+    return "\\s" * (len(text) - len(body)) + body.replace("\\", "\\\\")
 
 
 class Run:
@@ -275,7 +287,10 @@ class Run:
                          "[ -e /sys/class/net/wlan0/wireless ] && echo radio-ready; true")
         self.radio = radio.splitlines()[-1:] == ["radio-ready"]
         print(f"radio in the live system: {self.radio}", flush=True)
-        self.sh(f"wpa_passphrase '{WIFI_SSID}' '{WIFI_PASSPHRASE}' >> /etc/wpa_supplicant/wpa_supplicant.conf", what="a Wi-Fi network in wpa_supplicant.conf")
+        self.sh(f"wpa_passphrase {typed(WIFI_SSID)} {typed(WIFI_PASSPHRASE)} >> /etc/wpa_supplicant/wpa_supplicant.conf", what="a Wi-Fi network in wpa_supplicant.conf")
+        kept = self.out("grep -F '#psk=' /etc/wpa_supplicant/wpa_supplicant.conf | tail -n 1")
+        self.expect("typed in single quotes, a passphrase full of what a shell changes reaches wpa_supplicant's file as it is", kept == f'#psk="{WIFI_PASSPHRASE}"', kept)
+        self.note("the live system's shell for root: " + self.out("readlink /proc/$$/exe"))
 
         before = self.out(f"lsblk -nro NAME {self.disk_dev} | wc -l")
 
@@ -438,8 +453,8 @@ efibootmgr -v | grep Limine""", what="two firmware entries named Limine, one of 
 
         wifi = f"/var/lib/iwd/{WIFI_SSID}.psk"
         # (iwd itself takes its directory from 700 to 600 when it starts)
-        expect("the Wi-Fi network is saved for iwd, readable by root alone",
-               out(f"cat '{wifi}'") == f"[Security]\nPassphrase={WIFI_PASSPHRASE}" and out(f"stat -c %a '{wifi}'") == "600" and out("stat -c %a /var/lib/iwd").endswith("00"),
+        expect("the Wi-Fi network is saved for iwd the way iwd writes one itself, readable by root alone",
+               out(f"cat '{wifi}'") == f"[Security]\nPassphrase={iwd_value(WIFI_PASSPHRASE)}" and out(f"stat -c %a '{wifi}'") == "600" and out("stat -c %a /var/lib/iwd").endswith("00"),
                out(f"stat -c '%a %n' /var/lib/iwd '{wifi}'; cat '{wifi}'"))
         expect("iwd configures the network itself", "EnableNetworkConfiguration=true" in out("cat /etc/iwd/main.conf"), out("cat /etc/iwd/main.conf"))
 
@@ -467,6 +482,23 @@ efibootmgr -v | grep Limine""", what="two firmware entries named Limine, one of 
         self.note("of that, MiB: " + out("for d in /usr/lib/firmware /usr/lib/modules /usr/lib/locale /usr/share/man /usr/share/doc /usr/share/info /usr/share/locale /boot; do [ -d $d ] && printf '%s %s; ' $d $(du -sxm $d | cut -f1); done"))
         self.note("largest processes, RSS KiB: " + out("ps -eo rss=,comm= --sort=-rss | head -n 10 | awk '{printf \"%s %s; \", $2, $1}'"))
         self.note("xbps-pkgdb -a: " + (out("xbps-pkgdb -a 2>&1 | tail -n 3").replace("\n", " | ") or "nothing to say"))
+
+        # The Wi-Fi file once more, through ell: the library iwd reads its files with. It and
+        # Python are installed only now, for this question, after everything above was counted.
+        read = self.sh(f"""xbps-install -Sy ell python3 >/dev/null 2>&1
+python3 - '{wifi}' <<'PY'
+import ctypes, sys
+ell = ctypes.CDLL("libell.so.0")
+ell.l_settings_new.restype = ctypes.c_void_p
+ell.l_settings_load_from_file.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+ell.l_settings_load_from_file.restype = ctypes.c_bool
+ell.l_settings_get_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+ell.l_settings_get_string.restype = ctypes.c_void_p
+s = ell.l_settings_new()
+p = ell.l_settings_get_string(s, b"Security", b"Passphrase") if ell.l_settings_load_from_file(s, sys.argv[1].encode()) else None
+print("ell-read=[" + (ctypes.string_at(p).decode() if p else "nothing") + "]")
+PY""", check=False, timeout=900)
+        expect("ell, the library iwd reads its files with, takes the passphrase from that file as it was typed", f"ell-read=[{WIFI_PASSPHRASE}]" in read, read[-400:])
 
     def go(self):
         try:

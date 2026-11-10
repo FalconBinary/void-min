@@ -39,10 +39,13 @@ sha256sum -c sha256sum.txt --ignore-missing
 По кабелю сеть поднимется сама. Для Wi-Fi:
 
 ```sh
-wpa_passphrase "СЕТЬ" "ПАРОЛЬ" >> /etc/wpa_supplicant/wpa_supplicant.conf
+wpa_passphrase 'СЕТЬ' 'ПАРОЛЬ' >> /etc/wpa_supplicant/wpa_supplicant.conf
 sv restart wpa_supplicant
 sv restart dhcpcd
 ```
+
+Кавычки одинарные: в двойных shell сам заменит в пароле `$`, `!` и обратную кавычку, и сеть не
+подключится. Апостроф внутри пароля набирается как `'\''`.
 
 Затем:
 
@@ -70,7 +73,7 @@ dbus-run-session mango
 ```
 
 `Alt+Return` открывает терминал, `Super+m` завершает сеанс. Если Wi-Fi не был перенесён:
-`iwctl station wlan0 connect "СЕТЬ"`.
+`iwctl station wlan0 connect 'СЕТЬ'`.
 
 kombain поверх:
 

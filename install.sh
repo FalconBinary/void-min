@@ -280,6 +280,22 @@ iwd_file_name() {
 	fi
 }
 
+# iwd reads a value with escapes of its own: \\ is a backslash, and \s a space where the value
+# begins. Written as typed, C:\new would be read with a line break in it, any other letter after
+# a backslash would leave no passphrase at all, and a space in front would be dropped.
+iwd_value() {
+	rest=$1 front=
+	while [ "${rest# }" != "$rest" ]; do
+		rest=${rest# } front="$front\\s"
+	done
+	printf '%s%s\n' "$front" "$(printf '%s\n' "$rest" | sed 's/\\/\\\\/g')"
+}
+
+# The file iwd would write itself after `iwctl station ... connect`.
+iwd_file() {
+	printf '[Security]\n%s=%s\n' "$wifi_key" "$(iwd_value "$wifi_value")"
+}
+
 # ---------------------------------------------------------------- the disk
 
 # Disks that can be installed on: "name size-in-bytes model". Anything in use is left out, and
@@ -657,7 +673,7 @@ enter_root() {
 	cp -L /etc/resolv.conf /mnt/etc/resolv.conf
 }
 
-# The file iwd would write itself after `iwctl station ... connect`. Only root can read it.
+# Only root can read it: the passphrase is in it.
 save_wifi() {
 	[ -n "$wifi_ssid" ] || return 0
 	echo
@@ -665,7 +681,7 @@ save_wifi() {
 	[ "$dry_run" -eq 0 ] || return 0
 	file=$(iwd_file_name "$wifi_ssid")
 	install -d -m 700 /mnt/var/lib/iwd
-	(umask 077 && printf '[Security]\n%s=%s\n' "$wifi_key" "$wifi_value" > "/mnt/var/lib/iwd/$file")
+	(umask 077 && iwd_file > "/mnt/var/lib/iwd/$file")
 }
 
 # ---------------------------------------------------------------- before anything is erased
@@ -699,11 +715,12 @@ check_network() {
 	cat >&2 <<'EOF'
 install.sh: no network. With a cable it comes up by itself; for Wi-Fi:
 
-  wpa_passphrase "NETWORK" "PASSWORD" >> /etc/wpa_supplicant/wpa_supplicant.conf
+  wpa_passphrase 'NETWORK' 'PASSWORD' >> /etc/wpa_supplicant/wpa_supplicant.conf
   sv restart wpa_supplicant
   sv restart dhcpcd
 
-and run this again.
+Single quotes matter: in double ones the shell changes a password with $ or !.
+Then run this again.
 EOF
 	exit 1
 }

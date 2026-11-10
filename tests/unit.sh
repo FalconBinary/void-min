@@ -235,7 +235,7 @@ wifi() { # machine, [ssid]
 	on "$1" "wifi_from_wpa \"\$wpa_conf\" ${2:+\"$2\"}; echo \"\$wifi_ssid|\$wifi_key|\$wifi_value\""
 }
 hex=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-# as `wpa_passphrase "Home Net" "correct horse"` writes it, after the ISO's own lines
+# as `wpa_passphrase 'Home Net' 'correct horse'` writes it, after the ISO's own lines
 cat > "$work/gf63/wpa.conf" <<EOF
 ctrl_interface=DIR=/run/wpa_supplicant GROUP=wheel
 update_config=1
@@ -268,6 +268,25 @@ is "no file, no network" "$(wifi vm)" "||"
 
 is "a plain SSID names its own file" "$(lib 'iwd_file_name "Home Net-5_G"')" "Home Net-5_G.psk"
 is "any other SSID is spelled in hex" "$(lib 'iwd_file_name "a/b"')" "=612f62.psk"
+
+# iwd reads its files with escapes of its own. What it makes of each line below was asked of ell,
+# the library it reads them with; tests/vm.py asks again at every install.
+value() { V=$1 lib 'iwd_value "$V"'; }
+is "what iwd reads as typed is written as typed" "$(value 'pa$$w0rd!now "q" `t` =#;[x]')" 'pa$$w0rd!now "q" `t` =#;[x]'
+is "a backslash is doubled: iwd would read C:\\new with a line break in it, and \\d not at all" "$(value 'C:\new\dir')" 'C:\\new\\dir'
+is "spaces in front are spelled out, or iwd drops them; one at the end stays" "$(value '  two in front, one at the end ')" '\s\stwo in front, one at the end '
+# as wpa_passphrase writes a passphrase that only single quotes get past a shell
+cat > "$work/pascal/wpa.conf" <<'EOF'
+network={
+	ssid="Net"
+	#psk=" pa$$ "w" C:\new `tick` !"
+	psk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+}
+EOF
+is "the file for iwd holds such a passphrase the way iwd writes one itself" "$(on pascal 'wifi_from_wpa "$wpa_conf"; iwd_file')" '[Security]
+Passphrase=\spa$$ "w" C:\\new `tick` !'
+is "a key goes into it as it is" "$(on ryzen 'wifi_from_wpa "$wpa_conf" First; iwd_file')" "[Security]
+PreSharedKey=$hex"
 
 # ---------------------------------------------------------------- the whole run, dry
 
@@ -367,6 +386,34 @@ has "and it stops there" "$out" "exit 1"
 out=$(mirror silent)
 has "an address with no Void packages stops it" "$out" "no Void packages at https://x.org"
 has "and there" "$out" "exit 1"
+
+# ---------------------------------------------------------------- no network: what a person is told to type
+
+mkdir -p "$work/online" "$work/offline"
+printf '#!/bin/sh\nexit 0\n' > "$work/online/getent"
+printf '#!/bin/sh\nexit 2\n' > "$work/offline/getent"
+chmod +x "$work/online/getent" "$work/offline/getent"
+network() { # which stand-in for getent
+	PATH=$work/$1:$PATH lib 'mirror=https://x.org; check_network' 2>&1
+	echo "exit $?"
+}
+is "with a network it goes on" "$(network online)" "exit 0"
+out=$(network offline)
+has "without one it stops" "$out" "exit 1"
+has "and says how to join Wi-Fi" "$out" "install.sh: no network. With a cable it comes up by itself; for Wi-Fi:"
+shown=$(printf '%s\n' "$out" | grep wpa_passphrase | sed 's/^ *//')
+is "the command it shows, in single quotes" "$shown" "wpa_passphrase 'NETWORK' 'PASSWORD' >> /etc/wpa_supplicant/wpa_supplicant.conf"
+# The same command with a name and a password a shell would change in double quotes, typed where
+# the two words stand. This stands in for the real wpa_passphrase and shows what it was given.
+wpa_passphrase() { printf '%s|%s' "$1" "$2"; }
+net='Caf$HOME "5G"'
+pw='pa$$ `id` \n "q" !1'
+typed=${shown%%NETWORK*}$net${shown#*NETWORK}
+typed=${typed%%PASSWORD*}$pw${typed#*PASSWORD}
+is "typed as shown, the name and the password reach wpa_passphrase as they are" "$(eval "${typed%% >>*}")" "$(wpa_passphrase "$net" "$pw")"
+readme=$(cat "$here/../README.md")
+has "the README shows the command the same way" "$readme" "wpa_passphrase '"
+lacks "and nowhere a name or a password in double quotes" "$readme" 'wpa_passphrase "'
 
 # ---------------------------------------------------------------- the firmware's boot entries
 

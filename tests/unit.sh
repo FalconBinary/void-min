@@ -82,8 +82,14 @@ machine() { # name, cpu vendor
 	echo "vendor_id : $2" > "$work/$1/cpuinfo"
 }
 
+usbdev() { # machine, name, vendor as idVendor spells it
+	mkdir -p "$work/$1/usb/$2"
+	echo "$3" > "$work/$1/usb/$2/idVendor"
+}
+
 on() { # machine, shell text: the functions, looking at that machine
-	VOIDMIN_PCI=$work/$1/pci VOIDMIN_NET=$work/$1/net VOIDMIN_CPUINFO=$work/$1/cpuinfo VOIDMIN_WPA=$work/$1/wpa.conf lib "$2"
+	VOIDMIN_PCI=$work/$1/pci VOIDMIN_NET=$work/$1/net VOIDMIN_CPUINFO=$work/$1/cpuinfo VOIDMIN_WPA=$work/$1/wpa.conf \
+		VOIDMIN_USB=$work/$1/usb VOIDMIN_SDIO=$work/$1/sdio lib "$2"
 }
 
 # An MSI GF63 Thin 10SC: Intel graphics and Wi-Fi, a GTX 1650, no cable.
@@ -109,6 +115,16 @@ device kepler 0000:01:00.0 0x030000 0x10de 0x0fc6
 machine vm GenuineIntel
 device vm 0000:00:01.0 0x030000 0x1af4 0x1050
 iface vm eth0 wired up
+# A server: a Mellanox card and a Broadcom one. A PC with a Broadcom Bluetooth dongle, a tablet
+# whose Wi-Fi sits on SDIO.
+machine server GenuineIntel
+device server 0000:03:00.0 0x020000 0x15b3 0x1017
+device server 0000:04:00.0 0x020000 0x14e4 0x168e
+machine dongle AuthenticAMD
+usbdev dongle 1-2 0a5c
+usbdev dongle usb1 1d6b
+machine tablet GenuineIntel
+mkdir -p "$work/tablet/sdio/mmc1:0001:1"
 
 # ---------------------------------------------------------------- names and values
 
@@ -148,27 +164,44 @@ is "a mirror with shell in it is not" "$(status 'valid_mirror "https://x.org/;re
 
 is "GF63: the GTX 1650 gets nvidia" "$(on gf63 nvidia_package)" nvidia
 is "GF63: Mesa for Intel beside it" "$(on gf63 gpu_packages)" "mesa-dri vulkan-loader mesa-vulkan-intel"
-is "GF63: only AMD's firmware goes" "$(on gf63 firmware_to_drop)" " linux-firmware-amd"
+is "GF63: AMD's and Broadcom's firmware go, and nouveau's: NVIDIA's driver has its own" \
+	"$(on gf63 'nvidia=$(nvidia_package); firmware_to_drop')" " linux-firmware-nvidia linux-firmware-amd linux-firmware-broadcom"
 drivers=$(on gf63 'nvidia=$(nvidia_package); step_drivers')
 has "GF63: Intel microcode" "$drivers" "xbps-install -y intel-ucode"
 has "GF63: NVIDIA's driver" "$drivers" "xbps-install -y nvidia"
 has "GF63: the GPU may sleep" "$drivers" "NVreg_DynamicPowerManagement=0x02"
+has "GF63: without the settings window's GTK" "$drivers" "printf 'ignorepkg=%s\\n' nvidia-gtklibs > /etc/xbps.d/12-nvidia.conf"
 has "GF63: the kernel is told about NVIDIA's modeset" "$(on gf63 'nvidia=$(nvidia_package); kernel_cmdline')" "nvidia_drm.modeset=1"
 
 is "Pascal gets nvidia580" "$(on pascal nvidia_package)" nvidia580
 drivers=$(on pascal 'nvidia=$(nvidia_package); step_drivers')
 has "Pascal: its driver" "$drivers" "xbps-install -y nvidia580"
+has "Pascal: without its GTK either" "$drivers" "nvidia580-gtklibs"
 lacks "Pascal: no sleep option, that is Turing's" "$drivers" NVreg
 is "Kepler gets no driver from NVIDIA" "$(on kepler nvidia_package)" ""
+is "Kepler: Mesa drives it, so nouveau's firmware stays" "$(on kepler 'nvidia=$(nvidia_package); firmware_to_drop')" " linux-firmware-amd linux-firmware-broadcom"
 
 is "Ryzen: Mesa for Radeon" "$(on ryzen gpu_packages)" "mesa-dri vulkan-loader mesa-vulkan-radeon"
 is "Ryzen: no NVIDIA driver" "$(on ryzen nvidia_package)" ""
-is "Ryzen: Intel's firmware stays for its Wi-Fi card, NVIDIA's goes" "$(on ryzen firmware_to_drop)" " linux-firmware-nvidia"
+is "Ryzen: Intel's firmware stays for its Wi-Fi card, NVIDIA's and Broadcom's go" "$(on ryzen firmware_to_drop)" " linux-firmware-nvidia linux-firmware-broadcom"
+is "Ryzen: nothing here is non-free" "$(on ryzen 'if needs_nonfree; then echo yes; else echo no; fi')" no
+is "GF63: Intel's microcode and NVIDIA's driver are" "$(on gf63 'nvidia=$(nvidia_package); if needs_nonfree; then echo yes; else echo no; fi')" yes
 lacks "Ryzen: no Intel microcode" "$(on ryzen step_drivers)" intel-ucode
 lacks "Ryzen: no NVIDIA on the command line" "$(on ryzen kernel_cmdline)" nvidia
 
 is "VM: plain Mesa" "$(on vm gpu_packages)" "mesa-dri vulkan-loader"
-is "VM: an Intel CPU keeps Intel's firmware" "$(on vm firmware_to_drop)" " linux-firmware-nvidia linux-firmware-amd"
+is "VM: an Intel CPU keeps Intel's firmware" "$(on vm firmware_to_drop)" " linux-firmware-nvidia linux-firmware-amd linux-firmware-broadcom"
+is "a Broadcom card on PCI keeps Broadcom's" "$(on server firmware_to_drop)" " linux-firmware-nvidia linux-firmware-amd"
+is "so does a Broadcom dongle on USB" "$(on dongle firmware_to_drop)" " linux-firmware-nvidia linux-firmware-intel"
+is "and Wi-Fi on SDIO" "$(on tablet firmware_to_drop)" " linux-firmware-nvidia linux-firmware-amd"
+
+families=$(on gf63 server_firmware | tr '\n' ' ')
+is "a laptop unpacks no firmware for switches and server cards" "$families" \
+	"mellanox/* mrvl/prestera/* qed/* qlogic/* ql2* phanfw* cxgb3/* cxgb4/* bnx2/* bnx2x/* liquidio/* myri10ge* vxge/* ctfw* ct2fw* cbfw* slicoss/* "
+families=$(on server server_firmware | tr '\n' ' ')
+lacks "a server keeps its Mellanox card's" "$families" mellanox
+lacks "and its Broadcom card's" "$families" bnx2
+has "and still leaves out the makers it has nothing of" "$families" "mrvl/prestera/* qed/*"
 
 cmdline=$(on vm 'root_uuid=1234-abcd; kernel_cmdline')
 has "the command line names the root by UUID" "$cmdline" "root=UUID=1234-abcd rootfstype=xfs rw"
@@ -231,7 +264,7 @@ dry() { # machine, arguments
 	m=$1
 	shift
 	VOIDMIN_PCI=$work/$m/pci VOIDMIN_NET=$work/$m/net VOIDMIN_CPUINFO=$work/$m/cpuinfo VOIDMIN_WPA=$work/$m/wpa.conf \
-		VOIDMIN_ZONEINFO=$work/zoneinfo sh "$script" --dry-run "$@" 2>&1
+		VOIDMIN_USB=$work/$m/usb VOIDMIN_SDIO=$work/$m/sdio VOIDMIN_ZONEINFO=$work/zoneinfo sh "$script" --dry-run "$@" 2>&1
 }
 
 out=$(dry gf63 --disk /dev/nvme0n1 --timezone Europe/Kyiv)
@@ -241,8 +274,15 @@ has "GF63: XFS on the second partition" "$out" "mkfs.xfs -f -L root /dev/nvme0n1
 has "GF63: the user is Bivel, as written" "$out" "useradd --badname -m -G wheel,audio,video Bivel"
 has "GF63: the machine is void" "$out" "echo void > /etc/hostname"
 has "GF63: the time zone" "$out" "ln -sf /usr/share/zoneinfo/Europe/Kyiv /etc/localtime"
-has "GF63: mango and a terminal" "$out" "mangowc foot dejavu-fonts-ttf mesa-dri vulkan-loader mesa-vulkan-intel"
-has "GF63: without a cable dhcpcd goes" "$out" "ignorepkg=%s\\n' wpa_supplicant sudo btrfs-progs f2fs-tools dhcpcd linux-firmware-amd >"
+has "GF63: what starts it, joins Wi-Fi and shows a terminal in mango, and no more" "$out" \
+	"-R https://repo-de.voidlinux.org/current base-system zstd limine efibootmgr iwd openresolv dbus elogind chrony zramen snooze run-parts opendoas mangowc foot dejavu-fonts-ttf mesa-dri vulkan-loader mesa-vulkan-intel
+"
+lacks "GF63: git is left to kombain" "$out" "opendoas git"
+has "GF63: without a cable dhcpcd goes" "$out" "ignorepkg=%s\\n' wpa_supplicant sudo btrfs-progs f2fs-tools dhcpcd linux-firmware-nvidia linux-firmware-amd linux-firmware-broadcom >"
+has "GF63: server firmware is never unpacked" "$out" "printf 'noextract=/usr/lib/firmware/%s\\n' 'mellanox/*' 'mrvl/prestera/*'"
+has "GF63: the repository that is not free software, for microcode and NVIDIA" "$out" \
+	"printf 'repository=%s/nonfree\\n' https://repo-de.voidlinux.org/current > /mnt/etc/xbps.d/10-repository-nonfree.conf"
+has "GF63: the way to kombain starts with git" "$out" "That was a dry run"
 has "GF63: the services, and no more" "$out" "for s in udevd dbus elogind iwd chronyd zramen snooze-weekly agetty-tty1 agetty-tty2; do"
 has "GF63: the Wi-Fi network is named" "$out" "Wi-Fi: Home Net is saved for iwd"
 lacks "GF63: its passphrase is not shown" "$out" "correct horse"
@@ -256,7 +296,8 @@ has "Ryzen: SATA partition names" "$out" "mkfs.vfat -F32 -n EFI /dev/sda1"
 has "Ryzen: a lowercase name needs no flag" "$out" "useradd -m -G wheel,audio,video anna"
 has "Ryzen: the cable's own dhcpcd service" "$out" "cp -R /etc/sv/dhcpcd-eth0 /etc/sv/dhcpcd-enp6s0"
 has "Ryzen: and its link, with a serial login" "$out" "agetty-tty1 agetty-tty2 dhcpcd-enp6s0 agetty-ttyS0; do"
-has "Ryzen: dhcpcd stays" "$out" "ignorepkg=%s\\n' wpa_supplicant sudo btrfs-progs f2fs-tools linux-firmware-nvidia >"
+has "Ryzen: dhcpcd stays" "$out" "ignorepkg=%s\\n' wpa_supplicant sudo btrfs-progs f2fs-tools linux-firmware-nvidia linux-firmware-broadcom >"
+lacks "Ryzen: no repository that is not free software" "$out" nonfree
 has "Ryzen: the mirror, without its trailing slash" "$out" "repository=%s\\n' https://mirror.yandex.ru/mirrors/voidlinux/current >"
 has "Ryzen: the serial console" "$out" "console=tty0 console=ttyS0,115200"
 

@@ -30,6 +30,8 @@ root_uuid=ROOT-UUID efi_uuid=EFI-UUID
 
 # Where the hardware is read from: the tests point these at a made-up machine.
 pci=${VOIDMIN_PCI:-/sys/bus/pci/devices}
+usb=${VOIDMIN_USB:-/sys/bus/usb/devices}
+sdio=${VOIDMIN_SDIO:-/sys/bus/sdio/devices}
 net=${VOIDMIN_NET:-/sys/class/net}
 cpuinfo=${VOIDMIN_CPUINFO:-/proc/cpuinfo}
 wpa_conf=${VOIDMIN_WPA:-/etc/wpa_supplicant/wpa_supplicant.conf}
@@ -139,14 +141,60 @@ any_device() { # a PCI device of any kind from one of these vendors
 	return 1
 }
 
-# Firmware for makers this machine has nothing of: no CPU, and no device of any kind on the PCI
-# bus. An AMD laptop with an Intel Wi-Fi card keeps Intel's, which its Bluetooth needs too.
+usb_device() { # a USB device from this vendor, as idVendor spells it: 0a5c
+	for dev in "$usb"/*; do
+		[ -e "$dev/idVendor" ] || continue
+		if [ "$(cat "$dev/idVendor")" = "$1" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+has_sdio() {
+	for dev in "$sdio"/*; do
+		if [ -e "$dev" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Firmware packages for makers this machine has nothing of: no CPU, and no device of any kind on
+# the PCI bus. An AMD laptop with an Intel Wi-Fi card keeps Intel's, which its Bluetooth needs
+# too. linux-firmware-nvidia is nouveau's: the driver from NVIDIA brings its own, so it stays only
+# for an NVIDIA adapter that Mesa drives. Broadcom's stays for its Wi-Fi on PCI, USB or SDIO.
 firmware_to_drop() {
 	drop=
-	any_device 0x10de || drop="$drop linux-firmware-nvidia"
+	if [ -n "$nvidia" ] || ! any_device 0x10de; then
+		drop="$drop linux-firmware-nvidia"
+	fi
 	any_device 0x1002 0x1022 || cpu_is AuthenticAMD || drop="$drop linux-firmware-amd"
 	any_device 0x8086 || cpu_is GenuineIntel || drop="$drop linux-firmware-intel"
+	any_device 0x14e4 || usb_device 0a5c || has_sdio || drop="$drop linux-firmware-broadcom"
 	echo "$drop"
+}
+
+# Firmware no desktop or laptop has a use for: switch chips and server network cards, 195 of the
+# 440 MiB in linux-firmware-network. Each family goes unless a device of its maker is on the PCI
+# bus. These are patterns under /usr/lib/firmware that xbps then never unpacks, at an update either.
+# Wi-Fi, Bluetooth and Ethernet firmware for PCs all stays: a dongle plugged in later must work.
+server_firmware() {
+	any_device 0x15b3 || echo 'mellanox/*'
+	any_device 0x11ab 0x1b4b || echo 'mrvl/prestera/*'
+	any_device 0x1077 0x4040 || printf '%s\n' 'qed/*' 'qlogic/*' 'ql2*' 'phanfw*'
+	any_device 0x1425 || printf '%s\n' 'cxgb3/*' 'cxgb4/*'
+	any_device 0x14e4 || printf '%s\n' 'bnx2/*' 'bnx2x/*'
+	any_device 0x177d || echo 'liquidio/*'
+	any_device 0x14c1 || echo 'myri10ge*'
+	any_device 0x17d5 || echo 'vxge/*'
+	any_device 0x1657 || printf '%s\n' 'ctfw*' 'ct2fw*' 'cbfw*'
+	any_device 0x139a || echo 'slicoss/*'
+}
+
+# Intel's microcode and NVIDIA's driver are the only things here that are not free software.
+needs_nonfree() {
+	cpu_is GenuineIntel || [ -n "$nvidia" ]
 }
 
 # The wired interface that is up right now, if any.
@@ -303,8 +351,10 @@ ask_timezone() {
 
 # ---------------------------------------------------------------- the commands
 
+# What starts the machine, joins Wi-Fi, and shows a terminal in mango; nothing else. git is not
+# here: it brings perl, 130 MiB together, and kombain's install.sh installs it with its own tools.
 base_packages() {
-	echo "base-system zstd limine efibootmgr iwd openresolv dbus elogind chrony zramen snooze run-parts opendoas git void-repo-nonfree mangowc foot dejavu-fonts-ttf $(gpu_packages)"
+	echo "base-system zstd limine efibootmgr iwd openresolv dbus elogind chrony zramen snooze run-parts opendoas mangowc foot dejavu-fonts-ttf $(gpu_packages)"
 }
 
 # Quiet and with nothing that wakes the CPU for no reason: no watchdog, no kfence sampling, zram
@@ -334,16 +384,33 @@ EOF
 
 step_base() {
 	repo=$mirror/current
+	server=$(server_firmware | sed "s/.*/'&'/" | tr '\n' ' ')
 	cat <<EOF
 mkdir -p /mnt/var/db/xbps/keys /mnt/etc/xbps.d
 cp /var/db/xbps/keys/* /mnt/var/db/xbps/keys/
 printf 'noextract=%s\n' '/usr/share/locale/*' '!/usr/share/locale/ru/*' '!/usr/share/locale/en*' > /mnt/etc/xbps.d/20-noextract.conf
+EOF
+	if [ -n "$server" ]; then
+		cat <<EOF
+{
+	echo '# Firmware for switch chips and server network cards, which this machine has none of.'
+	echo '# To have it after all, remove this file and: xbps-install -f linux-firmware-network'
+	printf 'noextract=/usr/lib/firmware/%s\n' $server
+} > /mnt/etc/xbps.d/21-firmware.conf
+EOF
+	fi
+	cat <<EOF
 # the ISO's own xbps may be too old for today's packages
 xbps-install -Syi -R $repo xbps || true
 XBPS_ARCH=x86_64 xbps-install -Sy -r /mnt -R $repo $(base_packages)
 printf 'repository=%s\n' $repo > /mnt/etc/xbps.d/00-repository-main.conf
+EOF
+	# (a here-document, not echo: dash's echo would turn the \n into a line break itself)
+	if needs_nonfree; then
+		cat <<EOF
 printf 'repository=%s/nonfree\n' $repo > /mnt/etc/xbps.d/10-repository-nonfree.conf
 EOF
+	fi
 }
 
 step_system() {
@@ -368,7 +435,14 @@ EOF
 step_drivers() {
 	echo 'xbps-install -Sy'
 	if cpu_is GenuineIntel; then echo 'xbps-install -y intel-ucode'; fi
-	if [ -n "$nvidia" ]; then echo "xbps-install -y $nvidia"; fi
+	if [ -n "$nvidia" ]; then
+		# The driver's settings window is an X11 program that mango never shows. Its libraries
+		# would bring GTK 2 and 3, an icon theme, CUPS and Avahi with them: 32 packages.
+		cat <<EOF
+printf 'ignorepkg=%s\n' $nvidia-gtklibs > /etc/xbps.d/12-nvidia.conf
+xbps-install -y $nvidia
+EOF
+	fi
 	# Turing and newer sleep only when the driver is told they may
 	if [ "$nvidia" = nvidia ]; then
 		echo "echo 'options nvidia NVreg_DynamicPowerManagement=0x02' > /etc/modprobe.d/nvidia-sleep.conf"
@@ -636,6 +710,7 @@ Done. After the reboot, log in as $user on the first console and start the deskt
 
 kombain goes on top of this as it is:
 
+  doas xbps-install -S git
   git clone https://github.com/FalconBinary/kombain
   cd kombain && doas ./install.sh --user $user
 EOF
@@ -691,7 +766,7 @@ main() {
 	[ "$dry_run" -eq 1 ] || confirm_erase
 
 	live "The disk: two partitions and their file systems" "$(step_partition)"
-	live "The base system and mango (this downloads about 600 MiB)" "$(step_base)"
+	live "The base system and mango (this downloads about 900 MiB)" "$(step_base)"
 	if [ "$dry_run" -eq 0 ]; then
 		root_uuid=$(blkid -s UUID -o value "$disk${suffix}2")
 		efi_uuid=$(blkid -s UUID -o value "$disk${suffix}1")

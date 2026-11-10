@@ -314,7 +314,8 @@ class Run:
         say(rf"Wi-Fi: {re.escape(WIFI_SSID)} is saved for iwd")
         done = say(r"(?s)Done\. After the reboot.*?press Enter to reboot: ", timeout=self.o.install_timeout).group(0)
         self.expect("install.sh runs to its end", True)
-        self.expect("it says how to start the desktop and put kombain on top", "dbus-run-session mango" in done and f"doas ./install.sh --user {USER}" in done, done[-400:])
+        self.expect("it says how to start the desktop and put kombain on top, git first",
+                    "dbus-run-session mango" in done and "doas xbps-install -S git" in done and f"doas ./install.sh --user {USER}" in done, done[-400:])
         vm.send("\n")
         vm.wait_exit(180)
 
@@ -362,10 +363,18 @@ class Run:
         expect("swap is zram, compressed with zstd", "zram" in out("swapon --noheadings --show=NAME") and "[zstd]" in out("cat /sys/block/zram0/comp_algorithm"),
                out("swapon --show; cat /sys/block/zram0/comp_algorithm"))
 
-        gone = out("for p in wpa_supplicant sudo btrfs-progs f2fs-tools; do xbps-query $p >/dev/null 2>&1 && echo $p; done; true")
-        expect("what this machine does not need is gone", gone == "", gone)
-        here = out("for c in mango foot doas git iwctl limine zramen; do command -v $c >/dev/null || echo missing-$c; done; true")
-        expect("mango, a terminal, doas, git and iwd are there", here == "", here)
+        gone = out("for p in wpa_supplicant sudo btrfs-progs f2fs-tools linux-firmware-nvidia linux-firmware-broadcom git perl gtk+3; do xbps-query $p >/dev/null 2>&1 && echo $p; done; true")
+        expect("what this machine does not need is not installed: no git or perl either", gone == "", gone)
+        here = out("for c in mango foot doas iwctl limine zramen; do command -v $c >/dev/null || echo missing-$c; done; true")
+        expect("mango, a terminal, doas and iwd are there", here == "", here)
+        server = out("find /usr/lib/firmware/mellanox /usr/lib/firmware/mrvl/prestera /usr/lib/firmware/qed /usr/lib/firmware/cxgb4 -type f 2>/dev/null | wc -l")
+        expect("firmware for switches and server cards was never unpacked", server == "0" and "noextract=/usr/lib/firmware/mellanox/*" in out("cat /etc/xbps.d/21-firmware.conf"), server)
+        pc = out("ls /usr/lib/firmware/intel/iwlwifi | wc -l; ls /usr/lib/firmware/rtl_nic | wc -l; ls /usr/lib/firmware/ath11k | wc -l; ls /usr/lib/firmware/mediatek | wc -l").split()
+        expect("firmware a PC's Wi-Fi and Ethernet may ask for is all there", len(pc) == 4 and all(n.isdigit() and int(n) > 0 for n in pc), pc)
+        intel = "GenuineIntel" in out("grep -m1 vendor_id /proc/cpuinfo")
+        nonfree = out("test -e /etc/xbps.d/10-repository-nonfree.conf && echo yes || echo no")
+        ucode = out("xbps-query intel-ucode >/dev/null 2>&1 && echo yes || echo no")
+        expect("the repository that is not free software is there only for what needs it", (nonfree, ucode) == (("yes", "yes") if intel else ("no", "no")), f"intel={intel} nonfree={nonfree} ucode={ucode}")
         expect("mango finds all its libraries", out("ldd /usr/bin/mango | grep -c 'not found'") == "0", out("ldd /usr/bin/mango | grep 'not found'"))
         expect("mango's own default config is in place", out("grep -c '^bind=Alt,Return,spawn,foot' /etc/mango/config.conf") == "1", out("grep -n 'spawn,foot' /etc/mango/config.conf"))
         expect("doas is for wheel", out("cat /etc/doas.conf") == "permit :wheel" and out("stat -c %a /etc/doas.conf") == "400", out("cat /etc/doas.conf"))
@@ -392,6 +401,9 @@ class Run:
         self.note("kernel " + kernel + ", initramfs " + size + " MiB")
         self.note(out("free -m | awk '/^Mem/ {print \"memory used: \" $3 \" MiB of \" $2}'"))
         self.note("packages: " + out("xbps-query -l | wc -l") + ", processes: " + out("ps -e --no-headers | wc -l") + ", / holds " + out("du -sxm / 2>/dev/null | cut -f1") + " MiB")
+        self.note("of that, MiB: " + out("for d in /usr/lib/firmware /usr/lib/modules /usr/lib/locale /usr/share/man /usr/share/doc /usr/share/info /usr/share/locale /boot; do [ -d $d ] && printf '%s %s; ' $d $(du -sxm $d | cut -f1); done"))
+        self.note("largest processes, RSS KiB: " + out("ps -eo rss=,comm= --sort=-rss | head -n 10 | awk '{printf \"%s %s; \", $2, $1}'"))
+        self.note("xbps-pkgdb -a: " + (out("xbps-pkgdb -a 2>&1 | tail -n 3").replace("\n", " | ") or "nothing to say"))
 
     def go(self):
         try:
